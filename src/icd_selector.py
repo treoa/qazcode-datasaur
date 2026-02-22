@@ -126,13 +126,13 @@ def select_icd_code(
             line += f" — {desc}"
         candidate_lines.append(line)
 
-    from cleaning import clean_protocol_text
+    from cleaning import clean_protocol_text, get_protocol_title
 
     snippet = clean_protocol_text(protocol.get("text", "") or "")[:600]
 
     prompt = ICD_SELECTION_PROMPT.format(
         symptoms=symptoms,
-        protocol_title=protocol.get("title", "") or "",
+        protocol_title=get_protocol_title(protocol),
         protocol_snippet=snippet,
         candidate_list="\n".join(candidate_lines),
     )
@@ -140,7 +140,7 @@ def select_icd_code(
     try:
         result = llm_client.chat_json(
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=200,
+            max_tokens=1024,
             temperature=0.05,
         )
         selected = result.get("code", "").strip().upper()

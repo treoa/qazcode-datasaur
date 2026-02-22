@@ -37,13 +37,14 @@ from typing import Optional
 
 import numpy as np
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 _src_dir = os.path.dirname(__file__)
 if _src_dir not in sys.path:
     sys.path.insert(0, _src_dir)
 
-from cleaning import clean_query
+from cleaning import clean_query, get_protocol_title
 from icd_selector import select_icd_code, get_desc_map, build_candidate_list
 from llm_client import get_client
 from retrieval import get_retriever
@@ -51,8 +52,12 @@ from retrieval import get_retriever
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    force=True,
 )
 logger = logging.getLogger(__name__)
+# Ensure our logger is not swallowed by uvicorn
+logging.getLogger("src.server").setLevel(logging.INFO)
+logging.getLogger("server").setLevel(logging.INFO)
 
 # ---------------------------------------------------------------------------
 # Global singletons — loaded once at startup
@@ -233,17 +238,25 @@ def diagnose_query(symptoms: str) -> DiagnoseResponse:
     if not query:
         return DiagnoseResponse(diagnoses=[])
 
-    logger.info("Query: %s", query[:80])
+    logger.info("[1/4] Query: %s", query[:80])
 
     # Step 1 — Dense embedding (+ optional HyDE)
+    t0 = __import__("time").perf_counter()
     query_emb = _encode_query(query)
+    logger.info("[1/4] Embedding done (%.2fs)", __import__("time").perf_counter() - t0)
 
     # Step 2 — Hybrid retrieval: FAISS + BM25 → RRF → bge-reranker → top-5
+    t0 = __import__("time").perf_counter()
     top5 = _retriever.retrieve(
         query=query,
         query_embedding=query_emb,
         top_k=5,
         rerank=True,
+    )
+    logger.info(
+        "[2/4] Retrieval+rerank done (%.2fs), top1: %s",
+        __import__("time").perf_counter() - t0,
+        top5[0].get("protocol_id", "?") if top5 else "none",
     )
 
     if not top5:
@@ -252,21 +265,33 @@ def diagnose_query(symptoms: str) -> DiagnoseResponse:
     top1 = top5[0]
 
     # Step 3 — LLM selects single best ICD code from top-1 protocol
+    t0 = __import__("time").perf_counter()
     rank1_code, reasoning = select_icd_code(
         symptoms=query,
         protocol=top1,
         llm_client=_llm,
         desc_map=_desc_map,
     )
+    logger.info(
+        "[3/4] LLM selection done (%.2fs) → %s",
+        __import__("time").perf_counter() - t0,
+        rank1_code,
+    )
 
     # Step 4 — Fill ranks 2–3 from remaining codes of top-1 protocol
     fillers = _build_recall_fillers(top1, rank1_code, top5)
+    logger.info(
+        "[4/4] Result: rank1=%s rank2=%s rank3=%s",
+        rank1_code,
+        fillers[0] if fillers else "-",
+        fillers[1] if len(fillers) > 1 else "-",
+    )
 
     diagnoses: list[Diagnosis] = [
         Diagnosis(
             rank=1,
             icd10_code=rank1_code,
-            diagnosis=top1.get("title", "") or "",
+            diagnosis=get_protocol_title(top1),
             explanation=reasoning or "",
         )
     ]
@@ -276,17 +301,11 @@ def diagnose_query(symptoms: str) -> DiagnoseResponse:
             Diagnosis(
                 rank=i,
                 icd10_code=code,
-                diagnosis=top1.get("title", "") or "",
+                diagnosis=get_protocol_title(top1),
                 explanation="",
             )
         )
 
-    logger.info(
-        "Result: rank1=%s, rank2=%s, rank3=%s",
-        rank1_code,
-        fillers[0] if fillers else "-",
-        fillers[1] if len(fillers) > 1 else "-",
-    )
     return DiagnoseResponse(diagnoses=diagnoses)
 
 
@@ -308,3 +327,302 @@ async def health():
         "hyde_enabled": os.environ.get("HYDE_ENABLED", "0") == "1",
         "llm_provider": _llm.active_provider if _llm else "not loaded",
     }
+
+
+_UI_HTML = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ICD-10 Diagnostic Assistant</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #f5f5f7;
+    color: #1d1d1f;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 48px 16px 64px;
+  }
+
+  header {
+    text-align: center;
+    margin-bottom: 40px;
+  }
+  header h1 {
+    font-size: 1.75rem;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+  }
+  header p {
+    margin-top: 8px;
+    color: #6e6e73;
+    font-size: 0.95rem;
+  }
+
+  .card {
+    background: #fff;
+    border-radius: 16px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+    padding: 32px;
+    width: 100%;
+    max-width: 680px;
+  }
+
+  label {
+    display: block;
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: #3a3a3c;
+    margin-bottom: 8px;
+  }
+
+  textarea {
+    width: 100%;
+    min-height: 130px;
+    resize: vertical;
+    border: 1.5px solid #d1d1d6;
+    border-radius: 10px;
+    padding: 12px 14px;
+    font-size: 0.95rem;
+    font-family: inherit;
+    line-height: 1.5;
+    transition: border-color 0.15s;
+    outline: none;
+  }
+  textarea:focus { border-color: #0071e3; }
+
+  button {
+    margin-top: 16px;
+    width: 100%;
+    padding: 13px;
+    background: #0071e3;
+    color: #fff;
+    border: none;
+    border-radius: 10px;
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s, opacity 0.15s;
+  }
+  button:hover:not(:disabled) { background: #0077ed; }
+  button:disabled { opacity: 0.55; cursor: not-allowed; }
+
+  #status {
+    margin-top: 14px;
+    font-size: 0.875rem;
+    color: #6e6e73;
+    min-height: 20px;
+    text-align: center;
+  }
+
+  #results { margin-top: 28px; display: none; }
+
+  .result-title {
+    font-size: 0.8rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #6e6e73;
+    margin-bottom: 12px;
+  }
+
+  .diagnosis-card {
+    border: 1.5px solid #e5e5ea;
+    border-radius: 12px;
+    padding: 18px 20px;
+    margin-bottom: 10px;
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0 16px;
+    align-items: start;
+  }
+  .diagnosis-card.rank-1 { border-color: #0071e3; background: #f0f7ff; }
+
+  .rank-badge {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background: #e5e5ea;
+    color: #3a3a3c;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.8rem;
+    font-weight: 700;
+    flex-shrink: 0;
+    margin-top: 2px;
+  }
+  .rank-1 .rank-badge { background: #0071e3; color: #fff; }
+
+  .diagnosis-body {}
+  .icd-code {
+    font-size: 1.05rem;
+    font-weight: 700;
+    font-family: "SF Mono", "Fira Code", monospace;
+    color: #1d1d1f;
+  }
+  .diagnosis-name {
+    font-size: 0.88rem;
+    color: #3a3a3c;
+    margin-top: 2px;
+  }
+  .explanation {
+    margin-top: 8px;
+    font-size: 0.85rem;
+    color: #515154;
+    line-height: 1.55;
+    border-top: 1px solid #e5e5ea;
+    padding-top: 8px;
+  }
+  .rank-1 .explanation { border-color: #bbd6f5; }
+
+  #error-box {
+    display: none;
+    margin-top: 14px;
+    background: #fff2f2;
+    border: 1.5px solid #ffd2d2;
+    border-radius: 10px;
+    padding: 14px 16px;
+    font-size: 0.88rem;
+    color: #c0392b;
+  }
+
+  .spinner {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border: 2px solid rgba(255,255,255,0.4);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    vertical-align: middle;
+    margin-right: 6px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  footer {
+    margin-top: 40px;
+    font-size: 0.78rem;
+    color: #aeaeb2;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>ICD-10 Diagnostic Assistant</h1>
+  <p>Kazakhstan clinical protocol RAG &mdash; describe symptoms in Russian to get diagnoses</p>
+</header>
+
+<div class="card">
+  <label for="symptoms">Patient symptoms</label>
+  <textarea id="symptoms" placeholder="Опишите жалобы пациента на русском языке...&#10;Например: кашель, высокая температура, боль в груди при дыхании"></textarea>
+  <button id="submit-btn" onclick="diagnose()">Diagnose</button>
+  <div id="status"></div>
+  <div id="error-box"></div>
+  <div id="results">
+    <div class="result-title">Top diagnoses</div>
+    <div id="diagnosis-list"></div>
+  </div>
+</div>
+
+<footer>POST /diagnose &nbsp;&bull;&nbsp; GET /health &nbsp;&bull;&nbsp; Kazakhstan ICD-10 RAG pipeline</footer>
+
+<script>
+async function diagnose() {
+  const symptoms = document.getElementById('symptoms').value.trim();
+  if (!symptoms) return;
+
+  const btn = document.getElementById('submit-btn');
+  const status = document.getElementById('status');
+  const errorBox = document.getElementById('error-box');
+  const results = document.getElementById('results');
+  const list = document.getElementById('diagnosis-list');
+
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Diagnosing...';
+  status.textContent = 'Retrieving protocols and running LLM selection\u2026';
+  errorBox.style.display = 'none';
+  results.style.display = 'none';
+  list.innerHTML = '';
+
+  const start = Date.now();
+
+  try {
+    const resp = await fetch('/diagnose', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symptoms })
+    });
+
+    if (!resp.ok) {
+      const txt = await resp.text();
+      throw new Error(`HTTP ${resp.status}: ${txt}`);
+    }
+
+    const data = await resp.json();
+    const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+    status.textContent = `Done in ${elapsed}s`;
+
+    if (!data.diagnoses || data.diagnoses.length === 0) {
+      errorBox.textContent = 'No diagnoses returned. Try rephrasing the symptoms.';
+      errorBox.style.display = 'block';
+      return;
+    }
+
+    for (const d of data.diagnoses) {
+      const card = document.createElement('div');
+      card.className = 'diagnosis-card' + (d.rank === 1 ? ' rank-1' : '');
+
+      const explHTML = d.explanation
+        ? `<div class="explanation">${escapeHtml(d.explanation)}</div>`
+        : '';
+
+      card.innerHTML = `
+        <div class="rank-badge">${d.rank}</div>
+        <div class="diagnosis-body">
+          <div class="icd-code">${escapeHtml(d.icd10_code)}</div>
+          <div class="diagnosis-name">${escapeHtml(d.diagnosis)}</div>
+          ${explHTML}
+        </div>`;
+      list.appendChild(card);
+    }
+
+    results.style.display = 'block';
+
+  } catch (err) {
+    status.textContent = '';
+    errorBox.textContent = 'Error: ' + err.message;
+    errorBox.style.display = 'block';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Diagnose';
+  }
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+document.getElementById('symptoms').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) diagnose();
+});
+</script>
+</body>
+</html>"""
+
+
+@app.get("/", response_class=HTMLResponse)
+async def ui():
+    """GET / — serve the diagnostic web UI."""
+    return HTMLResponse(content=_UI_HTML)

@@ -172,3 +172,55 @@ def get_protocol_title(protocol: dict) -> str:
             return name[:150]
 
     return (protocol.get("title", "") or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic snippet extractor — for reranking
+# ---------------------------------------------------------------------------
+
+_DIAG_KEYWORDS = re.compile(
+    r"(Диагностические критерии|Жалобы\s*:|Жалобы\s*\n|"
+    r"Клинические признаки|Клинические проявления|"
+    r"МЕТОДЫ.{0,30}ДИАГНОСТИКИ|Клиническая картина)",
+    re.IGNORECASE,
+)
+
+
+def extract_diagnostic_snippet(protocol: dict, max_chars: int = 800) -> str:
+    """
+    Return the most diagnostically-relevant excerpt from a protocol for reranking.
+
+    Strategy:
+    1. Find the first occurrence of a diagnostic section header
+       (Диагностические критерии / Жалобы / Клиническая картина …)
+    2. If found, return `max_chars` of text starting from there
+    3. If not found within the first 10 000 chars, fall back to
+       title + cleaned text starting at char 1500 (skips most boilerplate)
+    """
+    title = get_protocol_title(protocol)
+    text = clean_protocol_text(protocol.get("text", "") or "")
+
+    # Prefer high-priority diagnostic keywords (Жалобы / Диагностические критерии)
+    # which appear in detailed clinical sections
+    priority_kw = re.compile(
+        r"(Диагностические критерии|Жалобы\s*[:\n]|"
+        r"Клинические признаки|Клинические проявления)",
+        re.IGNORECASE,
+    )
+    best_start = None
+    m_best = priority_kw.search(text, 0, 15000)
+    if m_best:
+        best_start = m_best.start()
+    else:
+        # Fall back to any diagnostic section header
+        m = _DIAG_KEYWORDS.search(text, 0, 15000)
+        if m:
+            best_start = m.start()
+
+    if best_start is not None:
+        snippet = text[best_start : best_start + max_chars]
+    else:
+        # Skip the usual 0-1500 char boilerplate (ICD table, abbreviations)
+        snippet = text[1500 : 1500 + max_chars]
+
+    return f"{title}\n{snippet}"

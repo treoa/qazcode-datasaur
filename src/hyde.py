@@ -63,7 +63,7 @@ def generate_hyde_document(symptoms: str, llm_client) -> str:
                     "content": HYDE_PROMPT.format(symptoms=symptoms),
                 }
             ],
-            max_tokens=300,
+            max_tokens=1024,
             temperature=0.3,
         )
         logger.debug("HyDE doc (first 100 chars): %s", doc[:100])

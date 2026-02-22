@@ -3,6 +3,7 @@ Multi-provider LLM client with automatic fallback.
 
 Priority order:
   1. Qazcode Hub (GPT-OSS) — QAZCODE_HUB_URL + QAZCODE_HUB_API_KEY
+     The Hub selects the model server-side; no model param is sent.
   2. Groq (free tier) — GROQ_API_KEY
      Model: llama-3.3-70b-versatile (30 RPM, 1K RPD, 12K TPM, 100K TPD)
   3. Google Gemini (free tier) — GEMINI_API_KEY
@@ -62,7 +63,7 @@ def _get_providers() -> list[ProviderConfig]:
     """Build ordered provider list from environment."""
     providers = []
 
-    # 1. Qazcode Hub (GPT-OSS)
+    # 1. Qazcode Hub (GPT-OSS) — model is selected server-side, no model param needed
     hub_url = os.environ.get("QAZCODE_HUB_URL", "")
     hub_key = os.environ.get("QAZCODE_HUB_API_KEY", "")
     hub_model = os.environ.get("QAZCODE_HUB_MODEL", "oss-120b")
@@ -158,11 +159,13 @@ class LLMClient:
                         base_url=provider.base_url,
                         api_key=provider.api_key,
                     )
+                    # Qazcode Hub selects the model server-side; sending a model
+                    # name would cause a 404/error. Other providers require it.
                     kwargs: dict = dict(
-                        model=provider.model,
                         messages=messages,
                         max_tokens=max_tokens,
                         temperature=temperature,
+                        model=provider.model,
                     )
                     if json_mode:
                         kwargs["response_format"] = {"type": "json_object"}
@@ -170,7 +173,24 @@ class LLMClient:
                     response = client.chat.completions.create(**kwargs)
                     logger.debug("Provider %s succeeded", provider.name)
                     # Return as dict for uniform access
-                    return response.model_dump()
+                    resp_dict = response.model_dump()
+                    # Reasoning models (e.g. qazcode_hub oss-120b) put the final
+                    # answer in content but may return null if max_tokens was hit
+                    # during the reasoning phase. Fall back to reasoning_content.
+                    choice = resp_dict["choices"][0]["message"]
+                    if not choice.get("content"):
+                        provider_fields = choice.get("provider_specific_fields") or {}
+                        fallback = (
+                            provider_fields.get("reasoning_content")
+                            or choice.get("reasoning_content")
+                            or ""
+                        )
+                        resp_dict["choices"][0]["message"]["content"] = fallback
+                        logger.warning(
+                            "Provider %s returned null content; using reasoning_content fallback",
+                            provider.name,
+                        )
+                    return resp_dict
 
                 except RateLimitError as e:
                     last_error = e
