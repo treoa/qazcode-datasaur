@@ -34,7 +34,7 @@ try:
 except ImportError:
     import pymorphy2
 
-from cleaning import clean_protocol_text
+from cleaning import clean_protocol_text, get_protocol_title
 
 # ---------------------------------------------------------------------------
 # BM25 tokenizer
@@ -195,10 +195,10 @@ def build_faiss_index(protocols: list[dict], output_path: str) -> np.ndarray:
 
     texts = []
     for p in protocols:
-        title = p.get("title", "") or ""
+        title = get_protocol_title(p)
         text = clean_protocol_text(p.get("text", "") or "")
-        # Use title + first ~2000 chars of cleaned text (512 token budget)
-        combined = f"{title} {text}"[:2500]
+        # Title + first ~2000 chars of cleaned text (512 token budget for bge-m3)
+        combined = f"{title}\n{text}"[:2500]
         texts.append(combined)
 
     print(f"Encoding {len(texts)} protocols (batch_size=8, this takes a while)...")
@@ -236,9 +236,9 @@ def build_bm25_index(protocols: list[dict], output_dir: str) -> None:
     for i, p in enumerate(protocols):
         if i % 100 == 0:
             print(f"  {i}/{len(protocols)}")
+        title = get_protocol_title(p)
         text = clean_protocol_text(p.get("text", "") or "")
-        title = p.get("title", "") or ""
-        combined = f"{title} {text}"
+        combined = f"{title}\n{text}"
         corpus_tokens.append(tokenize_russian(combined))
 
     retriever = bm25s.BM25(k1=1.5, b=0.4)

@@ -8,6 +8,7 @@ Handles:
 - Split-letter OCR artifacts (validated with pymorphy2)
 - Whitespace normalization
 - Query noise token stripping
+- Protocol title extraction from text / source_file
 """
 
 import re
@@ -131,3 +132,43 @@ def clean_query(query: str) -> str:
     query = re.sub(r"[\u200b\u200c\u200d\u2060\ufeff\u00ad]", "", query)
 
     return re.sub(r" {2,}", " ", query).strip()
+
+
+# ---------------------------------------------------------------------------
+# Protocol title extraction
+# ---------------------------------------------------------------------------
+
+_TITLE_STOP = re.compile(r"\s+(?:\d+\.\s|\d\.\d|\bI+\b\s+\w)", re.IGNORECASE)
+
+
+def get_protocol_title(protocol: dict) -> str:
+    """Return the best available human-readable title for a protocol.
+
+    Priority:
+      1. Extract from text body: 'КЛИНИЧЕСКИЙ ПРОТОКОЛ ...' line
+      2. Derive from source_file (strip .pdf, quotes)
+      3. Fall back to the raw title field even if short
+    """
+    text = protocol.get("text", "") or ""
+    m = re.search(
+        r"КЛИНИЧЕСКИЙ ПРОТОКОЛ[А-ЯЁA-Z\s\w«»()\-\./,]+",
+        text,
+        re.IGNORECASE,
+    )
+    if m:
+        candidate = m.group(0).strip()
+        # Trim at next numbered section
+        stop = _TITLE_STOP.search(candidate, 20)
+        if stop:
+            candidate = candidate[: stop.start()].strip()
+        if len(candidate) > 20:
+            return candidate[:150]
+
+    source_file = protocol.get("source_file", "") or ""
+    if source_file:
+        name = re.sub(r"\.pdf$", "", source_file, flags=re.IGNORECASE)
+        name = name.strip("«»\"' ")
+        if len(name) > 5:
+            return name[:150]
+
+    return (protocol.get("title", "") or "").strip()
