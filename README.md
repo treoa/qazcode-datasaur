@@ -41,6 +41,29 @@ Data Format
 ### Product Evaluation
 Working demo interface: user inputs symptoms → system returns diagnoses with ICD-10 codes;
 
+### Running the real server (conda / datasaur env)
+
+**Terminal 1 — start the server:**
+```bash
+cd /path/to/qazcode-nu
+conda activate datasaur
+uvicorn src.server:app --host 0.0.0.0 --port 8000 --log-level info
+```
+Wait for `Application startup complete.` in the logs (~30–60 s while FAISS index and embedding model load).
+
+The web UI is available at [http://localhost:8000](http://localhost:8000).
+
+**Terminal 2 — run evaluation (after server is ready):**
+```bash
+cd /path/to/qazcode-nu
+conda activate datasaur
+python evaluate.py -e http://127.0.0.1:8000/diagnose -d data/test_set -n <run_name> -p 3
+```
+
+Results are written to `data/evals/<run_name>.jsonl` and `data/evals/<run_name>_metrics.json`.
+
+**To stop the server:** press `Ctrl+C` in Terminal 1, or run `pkill -f uvicorn`.
+
 ---
 ## Getting Started
 
@@ -70,6 +93,7 @@ Then run the validation pipeline in a separate terminal:
 ```bash
 uv run python evaluate.py -e http://127.0.0.1:8000/diagnose -d ./data/test_set -n <your_team_name>
 ```
+
 `-e`: endpoint (POST request) that will accept the symptoms
 
 `-d`: path to the directory with protocols
